@@ -10,7 +10,7 @@ internal object LlamaNative {
     private const val TAG = "LlamaNative"
     private const val LIBRARY = "leantype_llama"
     /** loaded before [LIBRARY], in case the linker doesn't find them next to it */
-    private val DEPENDENCIES = listOf("ggml-base", "ggml", "llama", "llama-common")
+    private val DEPENDENCIES = listOf("c++_shared", "ggml-base", "ggml", "llama", "llama-common")
 
     @Volatile private var initialized = false
 

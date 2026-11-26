@@ -27,6 +27,8 @@ android {
         externalNativeBuild {
             cmake {
                 arguments "-DCMAKE_BUILD_TYPE=Release",
+                        // one C++ runtime for all libraries: exceptions of llama.cpp are caught in the bridge
+                        "-DANDROID_STL=c++_shared",
                         "-DBUILD_SHARED_LIBS=ON",
                         // one CPU backend per processor generation, the best one is chosen at runtime
                         "-DGGML_NATIVE=OFF",
