@@ -9,6 +9,9 @@ if (keystorePropertiesFile.exists()) {
     keystoreProperties.load(new FileInputStream(keystorePropertiesFile))
 }
 
+// ABIs to build, e.g. -Pplugin.abis=arm64-v8a for phones only (building llama.cpp takes a while)
+def pluginAbis = (project.findProperty('plugin.abis') ?: 'arm64-v8a,x86_64').toString().split(',').collect { it.trim() }
+
 android {
     namespace 'helium314.keyboard.ai.plugin'
     compileSdk 36
@@ -17,8 +20,30 @@ android {
         applicationId "helium314.keyboard.ai.plugin"
         minSdk 24
         targetSdk 36
-        versionCode 2
-        versionName "1.0.1"
+        versionCode 3
+        versionName "1.1.0"
+
+        // llama.cpp, built from the submodule app/src/main/cpp/llama.cpp
+        ndk {
+            abiFilters.addAll(pluginAbis)
+        }
+        externalNativeBuild {
+            cmake {
+                arguments "-DCMAKE_BUILD_TYPE=Release",
+                        "-DBUILD_SHARED_LIBS=ON",
+                        // one CPU backend per processor generation, the best one is chosen at runtime
+                        "-DGGML_NATIVE=OFF",
+                        "-DGGML_BACKEND_DL=ON",
+                        "-DGGML_CPU_ALL_VARIANTS=ON",
+                        "-DGGML_LLAMAFILE=OFF"
+            }
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            path "src/main/cpp/CMakeLists.txt"
+        }
     }
 
     signingConfigs {
@@ -50,7 +75,7 @@ android {
         abi {
             enable true
             reset()
-            include 'arm64-v8a', 'x86_64'
+            include(*pluginAbis)
             universalApk false
         }
     }
@@ -84,5 +109,4 @@ dependencies {
     implementation 'androidx.core:core-ktx:1.12.0'
     implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-core:1.8.1'
     implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1'
-    implementation 'io.github.ljcamargo:llamacpp-kotlin:0.4.0'
 }

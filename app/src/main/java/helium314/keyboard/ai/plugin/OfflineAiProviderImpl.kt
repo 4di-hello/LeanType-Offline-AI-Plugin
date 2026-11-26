@@ -3,288 +3,162 @@ package helium314.keyboard.ai.plugin
 
 import android.content.Context
 import android.net.Uri
+import android.os.ParcelFileDescriptor
 import android.util.Log
 import helium314.keyboard.latin.ai.IOfflineAiProvider
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.channels.BufferOverflow
-import kotlinx.coroutines.flow.MutableSharedFlow
-import kotlinx.coroutines.flow.takeWhile
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.runBlocking
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
-import org.nehuatl.llamacpp.LlamaHelper
 
+/**
+ * Offline AI with llama.cpp (see [LlamaNative]).
+ *
+ * [generate] takes the plain prompt as before. Additionally the keyboard can pass the chat messages
+ * as params "chat_system" and "chat_user" (and "enable_thinking"): then the chat format stored in
+ * the model file is used, which works for every model family (Gemma, Qwen, Llama, ...). Keyboards
+ * that don't pass them keep working with the plain prompt.
+ */
 class OfflineAiProviderImpl : IOfflineAiProvider {
     companion object {
         private const val TAG = "OfflineAiProviderImpl"
+        private val DEFAULT_STOPS = listOf("\nInput:", "\nInstruction:", "\nOutput:", "\nCorrected:", "<|im_end|>")
     }
 
+    private val lock = Any()
     private var appContext: Context? = null
     private var initialized = false
-
-    private var llamaHelper: LlamaHelper? = null
+    @Volatile private var loaded = false
     private var currentModelPath: String? = null
-    private var isLoaded: Boolean = false
-    private val loadMutex = Mutex()
-
-    private val scope = CoroutineScope(kotlinx.coroutines.SupervisorJob() + Dispatchers.IO)
-    private val llmFlow = MutableSharedFlow<LlamaHelper.LLMEvent>(
-        extraBufferCapacity = 2048,
-        onBufferOverflow = BufferOverflow.DROP_OLDEST
-    )
-
-    @Volatile
-    private var lastInferenceError: String? = null
+    /** open while the model is loaded: llama.cpp maps the file through it */
+    private var modelFile: ParcelFileDescriptor? = null
 
     override fun getInterfaceVersion(): Int = 1
 
     override fun init(context: Context) {
-        this.appContext = context.applicationContext ?: context
-        this.initialized = true
-        Log.i(TAG, "OfflineAiProviderImpl initialized")
+        appContext = context.applicationContext ?: context
+        LlamaNative.ensureInitialized()
+        initialized = true
+        Log.i(TAG, "initialized")
     }
 
     override fun isAvailable(): Boolean = initialized
 
-    override fun isModelLoaded(): Boolean = isLoaded && llamaHelper != null
+    override fun isModelLoaded(): Boolean = loaded
 
-    override fun loadModel(context: Context, modelPath: String, threads: Int, nCtx: Int): Boolean = runBlocking {
-        loadMutex.withLock {
-            if (isLoaded && currentModelPath == modelPath && llamaHelper != null) {
-                return@runBlocking true
+    override fun loadModel(context: Context, modelPath: String, threads: Int, nCtx: Int): Boolean = synchronized(lock) {
+        if (loaded && currentModelPath == modelPath) return true
+        unloadLocked()
+        LlamaNative.ensureInitialized()
+        val nThreads = if (threads > 0) threads else Runtime.getRuntime().availableProcessors().coerceAtMost(4)
+        val contextSize = if (nCtx > 0) nCtx else 4096
+        try {
+            val path: String
+            if (modelPath.startsWith("/")) {
+                path = modelPath
+            } else {
+                // a document picked by the user: llama.cpp opens it through this process' file descriptor
+                val resolver = (appContext ?: context).contentResolver
+                val pfd = resolver.openFileDescriptor(Uri.parse(modelPath), "r")
+                    ?: throw IllegalArgumentException("model file can't be opened")
+                modelFile = pfd
+                path = "/proc/self/fd/${pfd.fd}"
             }
-
-            unloadModelInternal()
-
-            try {
-                val ctx = appContext ?: context
-                val contentResolver = ctx.contentResolver
-                val helper = LlamaHelper(
-                    contentResolver,
-                    scope,
-                    llmFlow
-                )
-
-                val llamaField = LlamaHelper::class.java.getDeclaredField("llama\$delegate").apply { isAccessible = true }
-                val llamaLazy = llamaField.get(helper) as Lazy<org.nehuatl.llamacpp.LlamaAndroid>
-                val llama = llamaLazy.value
-
-                val uri = Uri.parse(modelPath)
-                val pfd = contentResolver.openFileDescriptor(uri, "r")
-                    ?: throw IllegalArgumentException("Failed to open model file descriptor")
-                val modelFd = pfd.detachFd()
-
-                val optimalThreads = if (threads > 0) threads else {
-                    val cores = Runtime.getRuntime().availableProcessors()
-                    if (cores <= 4) cores else 4
-                }
-
-                Log.i(TAG, "Loading GGUF model: path=$modelPath threads=$optimalThreads nCtx=$nCtx")
-
-                val params = mutableMapOf<String, Any>(
-                    "model" to modelPath,
-                    "model_fd" to modelFd,
-                    "use_mmap" to false,
-                    "use_mlock" to false,
-                    "n_ctx" to (if (nCtx > 0) nCtx else 2048),
-                    "embedding" to false,
-                    "n_batch" to 512,
-                    "n_threads" to optimalThreads,
-                    "n_gpu_layers" to 0,
-                    "vocab_only" to false,
-                    "lora" to "",
-                    "lora_scaled" to 1.0,
-                    "rope_freq_base" to 0.0,
-                    "rope_freq_scale" to 0.0
-                )
-
-                val callback: (String) -> Unit = { word ->
-                    try {
-                        val allTextField = LlamaHelper::class.java.getDeclaredField("allText").apply { isAccessible = true }
-                        val currentAllText = allTextField.get(helper) as String
-                        allTextField.set(helper, currentAllText + word)
-
-                        val tokenCountField = LlamaHelper::class.java.getDeclaredField("tokenCount").apply { isAccessible = true }
-                        val currentCount = tokenCountField.get(helper) as Int
-                        tokenCountField.set(helper, currentCount + 1)
-
-                        helper.sharedFlow.tryEmit(LlamaHelper.LLMEvent.Ongoing(word, currentCount + 1))
-                    } catch (e: Throwable) {
-                        Log.e(TAG, "Error in native token callback", e)
-                    }
-                }
-
-                val result = llama.startEngine(params, callback)
-                val contextId = result?.get("contextId") as? Int
-                    ?: throw IllegalStateException("contextId not found in engine start result")
-
-                val currentContextField = LlamaHelper::class.java.getDeclaredField("currentContext").apply { isAccessible = true }
-                currentContextField.set(helper, contextId)
-
-                helper.sharedFlow.tryEmit(LlamaHelper.LLMEvent.Loaded(modelPath))
-
-                llamaHelper = helper
-                currentModelPath = modelPath
-                isLoaded = true
-                Log.i(TAG, "Model loaded successfully into plugin engine")
-                true
-            } catch (e: Throwable) {
-                Log.e(TAG, "Failed to load GGUF model in plugin", e)
-                isLoaded = false
-                false
+            val start = System.currentTimeMillis()
+            // mapped: loads fast and the system can share the memory; read completely if mapping fails
+            var ok = LlamaNative.nativeLoad(path, contextSize, nThreads, true)
+            if (!ok) {
+                Log.w(TAG, "loading mapped failed (${LlamaNative.nativeLastError()}), reading the file instead")
+                ok = LlamaNative.nativeLoad(path, contextSize, nThreads, false)
             }
+            if (!ok) {
+                Log.e(TAG, "model not loaded: ${LlamaNative.nativeLastError()}")
+                unloadLocked()
+                return false
+            }
+            Log.i(TAG, "model loaded in ${System.currentTimeMillis() - start} ms, threads $nThreads, context $contextSize")
+            currentModelPath = modelPath
+            loaded = true
+            true
+        } catch (e: Throwable) {
+            Log.e(TAG, "model not loaded", e)
+            unloadLocked()
+            false
         }
     }
 
     override fun unloadModel() {
-        runBlocking {
-            loadMutex.withLock {
-                unloadModelInternal()
-            }
-        }
+        // stops a running generation, then frees the model
+        LlamaNative.nativeCancel()
+        synchronized(lock) { unloadLocked() }
     }
 
-    private fun unloadModelInternal() {
+    private fun unloadLocked() {
         try {
-            llamaHelper?.release()
-        } catch (e: Exception) {
-            Log.w(TAG, "Error unloading llama model", e)
+            LlamaNative.nativeUnload()
+        } catch (e: Throwable) {
+            Log.w(TAG, "error unloading the model", e)
         }
-        llamaHelper = null
+        try {
+            modelFile?.close()
+        } catch (_: Exception) {}
+        modelFile = null
         currentModelPath = null
-        isLoaded = false
+        loaded = false
     }
 
     override fun generate(prompt: String, params: Map<String, Any>?): String {
-        val helper = llamaHelper ?: throw IllegalStateException("Model not loaded in AI plugin")
-
-        val temp = (params?.get("temperature") as? Number)?.toFloat() ?: 0.2f
+        if (!loaded) throw IllegalStateException("Model not loaded in AI plugin")
+        val temperature = (params?.get("temperature") as? Number)?.toFloat() ?: 0.2f
         val topP = (params?.get("top_p") as? Number)?.toFloat() ?: 0.95f
         val topK = (params?.get("top_k") as? Number)?.toInt() ?: 40
         val minP = (params?.get("min_p") as? Number)?.toFloat() ?: 0.05f
         val maxTokens = (params?.get("max_tokens") as? Number)?.toInt() ?: 1024
+        val system = params?.get("chat_system") as? String
+        val user = params?.get("chat_user") as? String
+        val thinking = params?.get("enable_thinking") as? Boolean ?: false
+        val stops = (params?.get("stop") as? List<*>)?.filterIsInstance<String>() ?: DEFAULT_STOPS
 
-        var resultText = ""
-
-        runBlocking {
-            val job = predictWithParams(
-                helper = helper,
-                prompt = prompt,
-                temp = temp,
-                topP = topP,
-                topK = topK,
-                minP = minP,
-                maxTokens = maxTokens
+        val result = synchronized(lock) {
+            LlamaNative.nativeGenerate(
+                prompt.toByteArray(Charsets.UTF_8),
+                system?.toByteArray(Charsets.UTF_8),
+                user?.toByteArray(Charsets.UTF_8),
+                thinking, maxTokens, temperature, topP, topK, minP,
+                stops.map { it.toByteArray(Charsets.UTF_8) }.toTypedArray()
             )
-
-            job?.join()
-
-            try {
-                val allTextField = LlamaHelper::class.java.getDeclaredField("allText").apply { isAccessible = true }
-                resultText = (allTextField.get(helper) as? String) ?: ""
-            } catch (e: Throwable) {
-                Log.w(TAG, "Failed to read allText from helper", e)
-            }
         }
-
-        val err = lastInferenceError
-        if (err != null) {
-            throw RuntimeException("Inference error: $err")
-        }
-        return resultText.trim()
+        // only numbers: the texts are private
+        Log.i(TAG, LlamaNative.nativeLastStats())
+        if (result == null) throw RuntimeException("Inference error: ${LlamaNative.nativeLastError()}")
+        return String(result, Charsets.UTF_8).trim()
     }
 
     override fun proofread(text: String, instruction: String?): String {
         if (text.isBlank()) return text
         val instr = instruction ?: "Fix grammar, spelling, and punctuation errors. Return ONLY the corrected text without preamble."
-        val prompt = "<|im_start|>system\nYou are a professional proofreader. Correct grammatical, spelling, and punctuation errors while preserving original formatting.<|im_end|>\n<|im_start|>user\nInstruction: $instr\nText: $text<|im_end|>\n<|im_start|>assistant\n"
+        val system = "You are a professional proofreader. Correct grammatical, spelling, and punctuation errors while preserving original formatting."
+        val user = "Instruction: $instr\nText: $text"
+        val prompt = "<|im_start|>system\n$system<|im_end|>\n<|im_start|>user\n$user<|im_end|>\n<|im_start|>assistant\n"
         val tokensNeeded = maxOf(512, (text.length / 2.5).toInt() + 128)
-        val out = generate(prompt, mapOf("temperature" to 0.1, "max_tokens" to tokensNeeded))
+        val out = generate(prompt, mapOf("temperature" to 0.1, "max_tokens" to tokensNeeded, "chat_system" to system, "chat_user" to user))
         return cleanOutput(out)
     }
 
     override fun translate(text: String, sourceLang: String, targetLang: String): String {
         if (text.isBlank()) return text
-        val prompt = "<|im_start|>system\nYou are a professional translator. Translate from $sourceLang to $targetLang. Output ONLY the translation without preamble.<|im_end|>\n<|im_start|>user\nText: $text<|im_end|>\n<|im_start|>assistant\n"
+        val system = "You are a professional translator. Translate from $sourceLang to $targetLang. Output ONLY the translation without preamble."
+        val user = "Text: $text"
+        val prompt = "<|im_start|>system\n$system<|im_end|>\n<|im_start|>user\n$user<|im_end|>\n<|im_start|>assistant\n"
         val tokensNeeded = maxOf(512, (text.length / 2.5).toInt() + 128)
-        val out = generate(prompt, mapOf("temperature" to 0.2, "max_tokens" to tokensNeeded))
+        val out = generate(prompt, mapOf("temperature" to 0.2, "max_tokens" to tokensNeeded, "chat_system" to system, "chat_user" to user))
         return cleanOutput(out)
     }
 
     private fun cleanOutput(text: String): String {
         return text
+            .replace(Regex("<think>[\\s\\S]*?</think>", RegexOption.IGNORE_CASE), "")
             .replace(Regex("<thinking>[\\s\\S]*?</thinking>", RegexOption.IGNORE_CASE), "")
             .replace(Regex("<thought>[\\s\\S]*?</thought>", RegexOption.IGNORE_CASE), "")
             .replace(Regex("<reasoning>[\\s\\S]*?</reasoning>", RegexOption.IGNORE_CASE), "")
             .replace(Regex("<details>[\\s\\S]*?</details>", RegexOption.IGNORE_CASE), "")
             .trim()
-    }
-
-    private fun predictWithParams(
-        helper: LlamaHelper,
-        prompt: String,
-        temp: Float,
-        topP: Float,
-        topK: Int,
-        minP: Float,
-        maxTokens: Int
-    ): Job? {
-        lastInferenceError = null
-        try {
-            val currentContextField = LlamaHelper::class.java.getDeclaredField("currentContext").apply { isAccessible = true }
-            val currentContext = currentContextField.get(helper) as? Int ?: throw IllegalStateException("Model context not ready")
-
-            val llamaField = LlamaHelper::class.java.getDeclaredField("llama\$delegate").apply { isAccessible = true }
-            val llamaLazy = llamaField.get(helper) as Lazy<org.nehuatl.llamacpp.LlamaAndroid>
-            val llama = llamaLazy.value
-
-            val tokenCountField = LlamaHelper::class.java.getDeclaredField("tokenCount").apply { isAccessible = true }
-            tokenCountField.set(helper, 0)
-
-            val allTextField = LlamaHelper::class.java.getDeclaredField("allText").apply { isAccessible = true }
-            allTextField.set(helper, "")
-
-            helper.sharedFlow.tryEmit(LlamaHelper.LLMEvent.Started(prompt))
-
-            val params = mutableMapOf<String, Any>(
-                "prompt" to prompt,
-                "emit_partial_completion" to true,
-                "temperature" to temp.toDouble(),
-                "top_p" to topP.toDouble(),
-                "top_k" to topK,
-                "min_p" to minP.toDouble(),
-                "n_predict" to maxTokens,
-                "stop" to listOf("\nInput:", "\nInstruction:", "\nOutput:", "\nCorrected:", "<|im_end|>")
-            )
-
-            val completionJobField = LlamaHelper::class.java.getDeclaredField("completionJob").apply { isAccessible = true }
-
-            val job = helper.scope.launch {
-                val startTime = System.currentTimeMillis()
-                try {
-                    llama.launchCompletion(currentContext, params)
-                } catch (e: Throwable) {
-                    Log.e(TAG, "Completion failed", e)
-                    lastInferenceError = e.message ?: e.toString()
-                    helper.sharedFlow.tryEmit(LlamaHelper.LLMEvent.Error("Completion failed: ${e.message}"))
-                    return@launch
-                }
-                val duration = System.currentTimeMillis() - startTime
-                val allText = allTextField.get(helper) as String
-                val tokenCount = tokenCountField.get(helper) as Int
-                helper.sharedFlow.tryEmit(LlamaHelper.LLMEvent.Done(allText, tokenCount, duration))
-            }
-            completionJobField.set(helper, job)
-            return job
-        } catch (e: Throwable) {
-            Log.e(TAG, "Failed to setup prediction", e)
-            lastInferenceError = e.message ?: e.toString()
-            helper.sharedFlow.tryEmit(LlamaHelper.LLMEvent.Error("Failed to setup prediction: ${e.message}"))
-            return null
-        }
     }
 
     override fun cleanup() {
