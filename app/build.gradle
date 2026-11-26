@@ -23,10 +23,7 @@ android {
         versionCode 3
         versionName "1.1.0"
 
-        // llama.cpp, built from the submodule app/src/main/cpp/llama.cpp
-        ndk {
-            abiFilters.addAll(pluginAbis)
-        }
+        // llama.cpp, built from the submodule app/src/main/cpp/llama.cpp (ABIs: see splits)
         externalNativeBuild {
             cmake {
                 arguments "-DCMAKE_BUILD_TYPE=Release",
