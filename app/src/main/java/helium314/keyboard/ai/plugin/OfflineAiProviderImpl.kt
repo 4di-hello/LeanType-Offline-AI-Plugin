@@ -49,26 +49,27 @@ class OfflineAiProviderImpl : IOfflineAiProvider {
         val nThreads = if (threads > 0) threads else Runtime.getRuntime().availableProcessors().coerceAtMost(4)
         val contextSize = if (nCtx > 0) nCtx else 4096
         try {
-            val path: String
-            if (modelPath.startsWith("/")) {
-                path = modelPath
-            } else {
-                // a document picked by the user: llama.cpp opens it through this process' file descriptor
+            var path = modelPath
+            var fd = -1
+            if (!modelPath.startsWith("/")) {
+                // a document picked by the user: llama.cpp reads it through our file descriptor
                 val resolver = (appContext ?: context).contentResolver
                 val pfd = resolver.openFileDescriptor(Uri.parse(modelPath), "r")
                     ?: throw IllegalArgumentException("model file can't be opened")
                 modelFile = pfd
-                path = "/proc/self/fd/${pfd.fd}"
+                fd = pfd.fd
+                path = ""
             }
             val start = System.currentTimeMillis()
             // mapped: loads fast and the system can share the memory; read completely if mapping fails
-            var ok = LlamaNative.nativeLoad(path, contextSize, nThreads, true)
+            var ok = LlamaNative.nativeLoad(path, fd, contextSize, nThreads, true)
             if (!ok) {
                 Log.w(TAG, "loading mapped failed (${LlamaNative.nativeLastError()}), reading the file instead")
-                ok = LlamaNative.nativeLoad(path, contextSize, nThreads, false)
+                ok = LlamaNative.nativeLoad(path, fd, contextSize, nThreads, false)
             }
             if (!ok) {
-                Log.e(TAG, "model not loaded: ${LlamaNative.nativeLastError()}")
+                // the keyboard shows the last line with "failed" from the log
+                Log.e(TAG, "model loading failed: ${LlamaNative.nativeLastError()}")
                 unloadLocked()
                 return false
             }

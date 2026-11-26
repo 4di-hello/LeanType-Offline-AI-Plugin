@@ -35,7 +35,7 @@ internal object LlamaNative {
     }
 
     @JvmStatic external fun nativeInit(libDir: String)
-    @JvmStatic external fun nativeLoad(path: String, nCtx: Int, nThreads: Int, useMmap: Boolean): Boolean
+    @JvmStatic external fun nativeLoad(path: String, fd: Int, nCtx: Int, nThreads: Int, useMmap: Boolean): Boolean
     @JvmStatic external fun nativeGenerate(
         prompt: ByteArray, system: ByteArray?, user: ByteArray?, thinking: Boolean,
         maxTokens: Int, temperature: Float, topP: Float, topK: Int, minP: Float, stops: Array<ByteArray>

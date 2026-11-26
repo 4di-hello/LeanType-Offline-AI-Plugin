@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <exception>
 #include <mutex>
+#include <unistd.h>
 #include <string>
 #include <vector>
 
@@ -39,10 +40,18 @@ int g_n_batch = 512;
 std::atomic<bool> g_cancel{false};
 std::string g_error;
 std::string g_stats;
+FILE * g_model_file = nullptr; // open while the model is loaded
+std::mutex g_log_mutex;
+std::string g_last_log_error; // the last error llama.cpp logged, says why loading failed
 
 void log_callback(ggml_log_level level, const char * text, void *) {
     // only problems: llama.cpp does not log texts, but the info output is very long
     if (level != GGML_LOG_LEVEL_WARN && level != GGML_LOG_LEVEL_ERROR) return;
+    if (level == GGML_LOG_LEVEL_ERROR && text != nullptr) {
+        std::lock_guard<std::mutex> lock(g_log_mutex);
+        g_last_log_error = text;
+        while (!g_last_log_error.empty() && (g_last_log_error.back() == '\n' || g_last_log_error.back() == ' ')) g_last_log_error.pop_back();
+    }
 #ifdef __ANDROID__
     __android_log_print(level == GGML_LOG_LEVEL_ERROR ? ANDROID_LOG_ERROR : ANDROID_LOG_WARN, LOG_TAG, "%s", text);
 #else
@@ -90,6 +99,12 @@ void unload_locked() {
     g_templates.reset();
     if (g_ctx != nullptr) { llama_free(g_ctx); g_ctx = nullptr; }
     if (g_model != nullptr) { llama_model_free(g_model); g_model = nullptr; }
+    if (g_model_file != nullptr) { fclose(g_model_file); g_model_file = nullptr; }
+}
+
+std::string last_log_error() {
+    std::lock_guard<std::mutex> lock(g_log_mutex);
+    return g_last_log_error;
 }
 
 // decodes tokens starting at position pos, logits only for the last one
@@ -126,25 +141,47 @@ Java_helium314_keyboard_ai_plugin_LlamaNative_nativeInit(JNIEnv * env, jclass, j
     env->ReleaseStringUTFChars(jlib_dir, dir);
     llama_backend_init();
     g_backend_ready = true;
-    LOGI("backend ready: %s", llama_print_system_info());
+    LOGI("backend ready (%zu devices): %s", ggml_backend_dev_count(), llama_print_system_info());
 }
 
 JNIEXPORT jboolean JNICALL
-Java_helium314_keyboard_ai_plugin_LlamaNative_nativeLoad(JNIEnv * env, jclass, jstring jpath, jint n_ctx,
+Java_helium314_keyboard_ai_plugin_LlamaNative_nativeLoad(JNIEnv * env, jclass, jstring jpath, jint fd, jint n_ctx,
                                                          jint n_threads, jboolean use_mmap) {
     std::lock_guard<std::mutex> lock(g_mutex);
     unload_locked();
     g_error.clear();
+    { std::lock_guard<std::mutex> log_lock(g_log_mutex); g_last_log_error.clear(); }
     const auto start = std::chrono::steady_clock::now();
 
     llama_model_params model_params = llama_model_default_params();
+    if (ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU) == nullptr) {
+        g_error = "no CPU backend: the libraries of the plugin were not found";
+        return JNI_FALSE;
+    }
     model_params.n_gpu_layers = 0;
     model_params.load_mode = use_mmap ? LLAMA_LOAD_MODE_MMAP : LLAMA_LOAD_MODE_NONE;
-    const char * path = env->GetStringUTFChars(jpath, nullptr);
-    g_model = llama_model_load_from_file(path, model_params);
-    env->ReleaseStringUTFChars(jpath, path);
+    if (fd >= 0) {
+        // a document picked by the user: read through the descriptor we got for it, the app may not
+        // be allowed to open the file by its path
+        const int own_fd = dup(fd);
+        // the duplicate shares the position with the original, which a failed attempt may have moved
+        if (own_fd >= 0) lseek(own_fd, 0, SEEK_SET);
+        g_model_file = own_fd >= 0 ? fdopen(own_fd, "rb") : nullptr;
+        if (g_model_file == nullptr) {
+            if (own_fd >= 0) close(own_fd);
+            g_error = "the model file can't be read";
+            return JNI_FALSE;
+        }
+        g_model = llama_model_load_from_file_ptr(g_model_file, model_params);
+    } else {
+        const char * path = env->GetStringUTFChars(jpath, nullptr);
+        g_model = llama_model_load_from_file(path, model_params);
+        env->ReleaseStringUTFChars(jpath, path);
+    }
     if (g_model == nullptr) {
-        g_error = "the model could not be loaded (file damaged or model type not supported)";
+        const std::string reason = last_log_error();
+        g_error = reason.empty() ? "file damaged or model type not supported" : reason;
+        unload_locked();
         return JNI_FALSE;
     }
 
