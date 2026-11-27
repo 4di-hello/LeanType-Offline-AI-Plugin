@@ -116,8 +116,11 @@ class OfflineAiProviderImpl : IOfflineAiProvider {
         val system = params?.get("chat_system") as? String
         val user = params?.get("chat_user") as? String
         val thinking = params?.get("enable_thinking") as? Boolean ?: false
+        // the thoughts are removed from the answer; with this they are put in front of it in <think> tags
+        val showThinking = params?.get("show_thinking") as? Boolean ?: false
         val stops = (params?.get("stop") as? List<*>)?.filterIsInstance<String>() ?: DEFAULT_STOPS
 
+        var reasoning = ""
         val result = synchronized(lock) {
             LlamaNative.nativeGenerate(
                 prompt.toByteArray(Charsets.UTF_8),
@@ -125,7 +128,7 @@ class OfflineAiProviderImpl : IOfflineAiProvider {
                 user?.toByteArray(Charsets.UTF_8),
                 thinking, maxTokens, temperature, topP, topK, minP,
                 stops.map { it.toByteArray(Charsets.UTF_8) }.toTypedArray()
-            )
+            ).also { if (showThinking) reasoning = String(LlamaNative.nativeLastReasoning(), Charsets.UTF_8).trim() }
         }
         // only numbers: the texts are private
         Log.i(TAG, LlamaNative.nativeLastStats())
@@ -134,7 +137,7 @@ class OfflineAiProviderImpl : IOfflineAiProvider {
         // a broken model or computation gives only unused control tokens: never insert those into the text
         if (text.isNotEmpty() && CONTROL_TOKENS_ONLY.matches(text))
             throw RuntimeException("Inference error: the model produced only control tokens (model file or engine problem)")
-        return text
+        return if (reasoning.isEmpty()) text else "<think>\n$reasoning\n</think>\n\n$text"
     }
 
     override fun proofread(text: String, instruction: String?): String {

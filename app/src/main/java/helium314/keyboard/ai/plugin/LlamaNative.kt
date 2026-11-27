@@ -44,4 +44,6 @@ internal object LlamaNative {
     @JvmStatic external fun nativeUnload()
     @JvmStatic external fun nativeLastError(): String
     @JvmStatic external fun nativeLastStats(): String
+    /** what the model thought in the last generation (UTF-8), empty if thinking was off */
+    @JvmStatic external fun nativeLastReasoning(): ByteArray
 }

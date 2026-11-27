@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cstdio>
 #include <exception>
+#include <memory>
 #include <mutex>
 #include <unistd.h>
 #include <string>
@@ -40,6 +41,7 @@ int g_n_batch = 512;
 std::atomic<bool> g_cancel{false};
 std::string g_error;
 std::string g_stats;
+std::string g_reasoning; // what the model thought in the last generation, only when thinking was on
 FILE * g_model_file = nullptr; // open while the model is loaded
 std::mutex g_log_mutex;
 std::string g_last_log_error; // the last error llama.cpp logged, says why loading failed
@@ -222,6 +224,7 @@ Java_helium314_keyboard_ai_plugin_LlamaNative_nativeGenerate(
     std::lock_guard<std::mutex> lock(g_mutex);
     g_error.clear();
     g_stats.clear();
+    g_reasoning.clear();
     g_cancel.store(false);
     if (g_model == nullptr || g_ctx == nullptr) {
         g_error = "no model loaded";
@@ -243,6 +246,8 @@ Java_helium314_keyboard_ai_plugin_LlamaNative_nativeGenerate(
     // the prompt: chat messages in the chat format of the model if it has one, otherwise the plain prompt
     std::vector<llama_token> tokens;
     bool used_template = false;
+    // knows the chat format of the model: separates what it thinks from the answer
+    std::unique_ptr<common_chat_session> session;
     if (juser != nullptr && g_templates && common_chat_templates_was_explicit(g_templates.get())) {
         try {
             common_chat_templates_inputs inputs;
@@ -260,18 +265,22 @@ Java_helium314_keyboard_ai_plugin_LlamaNative_nativeGenerate(
             inputs.add_generation_prompt = true;
             inputs.use_jinja = true;
             inputs.enable_thinking = thinking == JNI_TRUE;
-            const common_chat_params chat = common_chat_templates_apply(g_templates.get(), inputs);
-            for (size_t i = 0; i < chat.prompt.parts.size(); i++) {
-                const auto & part = chat.prompt.parts[i];
+            // thoughts go into reasoning_content, not into the answer (as llama-server does by default)
+            inputs.reasoning_format = COMMON_REASONING_FORMAT_AUTO;
+            session = std::make_unique<common_chat_session>(g_templates.get(), vocab, inputs);
+            const auto & parts = session->prompt().parts;
+            for (size_t i = 0; i < parts.size(); i++) {
+                const auto & part = parts[i];
                 // special tokens only from the template, never from the text (e.g. pasted "<|im_end|>")
                 const auto part_tokens = common_tokenize(vocab, part.text, i == 0, !part.is_input);
                 tokens.insert(tokens.end(), part_tokens.begin(), part_tokens.end());
             }
-            for (const auto & stop : chat.additional_stops) stops.push_back(stop);
+            for (const auto & stop : session->additional_stops()) stops.push_back(stop);
             used_template = !tokens.empty();
         } catch (const std::exception & e) {
             LOGW("chat template failed, using the plain prompt: %s", e.what());
             tokens.clear();
+            session.reset();
         }
     }
     if (!used_template) {
@@ -301,6 +310,7 @@ Java_helium314_keyboard_ai_plugin_LlamaNative_nativeGenerate(
     sampling.top_p = top_p;
     sampling.top_k = top_k;
     sampling.min_p = min_p;
+    if (session) session->apply_sampling(sampling);
     common_sampler * sampler = common_sampler_init(g_model, sampling);
     if (sampler == nullptr) {
         g_error = "sampler could not be created";
@@ -308,6 +318,8 @@ Java_helium314_keyboard_ai_plugin_LlamaNative_nativeGenerate(
     }
 
     std::string output;
+    // the same with the tokens of the chat format (e.g. where thinking ends), for the session
+    common_chat_input chat_output;
     int n_generated = 0;
     llama_pos pos = n_prompt;
     common_batch batch(g_ctx);
@@ -320,6 +332,7 @@ Java_helium314_keyboard_ai_plugin_LlamaNative_nativeGenerate(
         if (llama_vocab_is_eog(vocab, token)) break;
         n_generated++;
         output += common_token_to_piece(g_ctx, token, false);
+        if (session) chat_output.append(common_token_to_piece(g_ctx, token, sampling.preserved_tokens.count(token) > 0), token);
         for (const auto & stop : stops) {
             // only the end can contain a new match
             const size_t from = output.size() > stop.size() + 64 ? output.size() - stop.size() - 64 : 0;
@@ -343,13 +356,32 @@ Java_helium314_keyboard_ai_plugin_LlamaNative_nativeGenerate(
     common_sampler_free(sampler);
     output.resize(output.size() - incomplete_utf8_tail(output));
 
+    // the answer without the thoughts; the plain text as before if the chat format can't parse it
+    bool thinking_unfinished = false;
+    if (session && !stopped && g_error.empty()) {
+        try {
+            const common_chat_msg & msg = session->finish(chat_output);
+            g_reasoning = msg.reasoning_content;
+            if (!msg.content.empty()) {
+                output = msg.content;
+            } else if (!g_reasoning.empty()) {
+                // it was still thinking when the tokens ran out
+                g_error = "the model was still thinking after " + std::to_string(n_generated) +
+                          " tokens: allow longer answers or switch thinking off";
+                thinking_unfinished = true;
+            }
+        } catch (const std::exception & e) {
+            LOGW("chat output not parsed, using the plain text: %s", e.what());
+        }
+    }
+
     char stats[256];
     snprintf(stats, sizeof(stats), "prompt %d tokens %.0f ms (%.1f t/s), generated %d tokens %.0f ms (%.1f t/s), template %s",
              n_prompt, prompt_ms, prompt_ms > 0 ? n_prompt * 1000.0 / prompt_ms : 0.0,
              n_generated, gen_ms, gen_ms > 0 ? n_generated * 1000.0 / gen_ms : 0.0, used_template ? "yes" : "no");
     g_stats = stats;
     LOGI("%s", stats);
-    if (g_error == "cancelled") return nullptr;
+    if (g_error == "cancelled" || thinking_unfinished) return nullptr;
     return to_bytes(env, output);
 }
 
@@ -369,6 +401,12 @@ JNIEXPORT jstring JNICALL
 Java_helium314_keyboard_ai_plugin_LlamaNative_nativeLastError(JNIEnv * env, jclass) {
     std::lock_guard<std::mutex> lock(g_mutex);
     return env->NewStringUTF(g_error.c_str());
+}
+
+JNIEXPORT jbyteArray JNICALL
+Java_helium314_keyboard_ai_plugin_LlamaNative_nativeLastReasoning(JNIEnv * env, jclass) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    return to_bytes(env, g_reasoning);
 }
 
 JNIEXPORT jstring JNICALL
