@@ -18,6 +18,7 @@ import helium314.keyboard.latin.ai.IOfflineAiProvider
 class OfflineAiProviderImpl : IOfflineAiProvider {
     companion object {
         private const val TAG = "OfflineAiProviderImpl"
+        private val CONTROL_TOKENS_ONLY = Regex("^(\\s*(<unused\\d+>|\\[multimodal\\]|<bos>|<eos>|<pad>|<mask>))+\\s*$")
         private val DEFAULT_STOPS = listOf("\nInput:", "\nInstruction:", "\nOutput:", "\nCorrected:", "<|im_end|>")
     }
 
@@ -128,7 +129,11 @@ class OfflineAiProviderImpl : IOfflineAiProvider {
         // only numbers: the texts are private
         Log.i(TAG, LlamaNative.nativeLastStats())
         if (result == null) throw RuntimeException("Inference error: ${LlamaNative.nativeLastError()}")
-        return String(result, Charsets.UTF_8).trim()
+        val text = String(result, Charsets.UTF_8).trim()
+        // a broken model or computation gives only unused control tokens: never insert those into the text
+        if (text.isNotEmpty() && CONTROL_TOKENS_ONLY.matches(text))
+            throw RuntimeException("Inference error: the model produced only control tokens (model file or engine problem)")
+        return text
     }
 
     override fun proofread(text: String, instruction: String?): String {

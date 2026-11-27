@@ -191,6 +191,8 @@ Java_helium314_keyboard_ai_plugin_LlamaNative_nativeLoad(JNIEnv * env, jclass, j
     ctx_params.n_ubatch = static_cast<uint32_t>(g_n_batch);
     ctx_params.n_threads = n_threads > 0 ? n_threads : 4;
     ctx_params.n_threads_batch = ctx_params.n_threads;
+    // test: without flash attention (Gemma 4 has different head sizes per layer)
+    ctx_params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
     ctx_params.abort_callback = abort_callback;
     ctx_params.abort_callback_data = nullptr;
     g_ctx = llama_init_from_model(g_model, ctx_params);
