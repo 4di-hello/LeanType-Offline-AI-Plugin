@@ -62,11 +62,12 @@ class OfflineAiProviderImpl : IOfflineAiProvider {
                 path = ""
             }
             val start = System.currentTimeMillis()
-            // mapped: loads fast and the system can share the memory; read completely if mapping fails
-            var ok = LlamaNative.nativeLoad(path, fd, contextSize, nThreads, true)
+            // read completely: the first answer comes faster and the weights are repacked for the CPU;
+            // mapped if that fails (e.g. not enough memory), then the system reads the file when needed
+            var ok = LlamaNative.nativeLoad(path, fd, contextSize, nThreads, false)
             if (!ok) {
-                Log.w(TAG, "loading mapped failed (${LlamaNative.nativeLastError()}), reading the file instead")
-                ok = LlamaNative.nativeLoad(path, fd, contextSize, nThreads, false)
+                Log.w(TAG, "reading the model failed (${LlamaNative.nativeLastError()}), mapping the file instead")
+                ok = LlamaNative.nativeLoad(path, fd, contextSize, nThreads, true)
             }
             if (!ok) {
                 // the keyboard shows the last line with "failed" from the log
