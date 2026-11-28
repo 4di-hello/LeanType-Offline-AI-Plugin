@@ -20,8 +20,8 @@ android {
         applicationId "helium314.keyboard.ai.plugin"
         minSdk 24
         targetSdk 36
-        versionCode 5
-        versionName "1.2.0"
+        versionCode 6
+        versionName "1.2.1"
 
         // llama.cpp, built from the submodule app/src/main/cpp/llama.cpp (ABIs: see splits)
         externalNativeBuild {

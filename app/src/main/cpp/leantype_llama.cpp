@@ -9,14 +9,17 @@
 #include <chrono>
 #include <cstdio>
 #include <exception>
+#include <fstream>
 #include <memory>
 #include <mutex>
+#include <sched.h>
 #include <unistd.h>
 #include <string>
 #include <vector>
 
 #include "chat.h"
 #include "common.h"
+#include "ggml-cpu.h"
 #include "llama.h"
 #include "sampling.h"
 
@@ -97,9 +100,68 @@ size_t incomplete_utf8_tail(const std::string & text) {
     return 0;
 }
 
+// own threads on the fastest cores (see fast_cores)
+ggml_threadpool * g_threadpool = nullptr;
+decltype(ggml_threadpool_free) * g_threadpool_free = nullptr;
+std::string g_cores; // which cores compute, for the stats: "7,4,5,6 of 0-7"
+
+/**
+ * The [n] fastest cores this process may use, by their highest clock. A phone has cores of different
+ * speed; with more threads than fast cores every step waits for a slow one (measured: 4 threads twice
+ * as fast as 8). Empty if it can't be told, then the system places the threads.
+ */
+std::vector<int> fast_cores(int n, std::string & desc) {
+    cpu_set_t allowed;
+    CPU_ZERO(&allowed);
+    if (sched_getaffinity(0, sizeof(allowed), &allowed) != 0) return {};
+    std::vector<std::pair<long, int>> cpus; // max kHz, cpu
+    std::string allowed_list;
+    for (int i = 0; i < CPU_SETSIZE && i < GGML_MAX_N_THREADS; i++) {
+        if (!CPU_ISSET(i, &allowed)) continue;
+        allowed_list += (allowed_list.empty() ? "" : ",") + std::to_string(i);
+        long khz = 0;
+        std::ifstream file("/sys/devices/system/cpu/cpu" + std::to_string(i) + "/cpufreq/cpuinfo_max_freq");
+        file >> khz;
+        cpus.emplace_back(khz, i);
+    }
+    desc = "? of " + allowed_list;
+    if (cpus.empty() || std::any_of(cpus.begin(), cpus.end(), [](const auto & c) { return c.first <= 0; })) return {};
+    std::stable_sort(cpus.begin(), cpus.end(), [](const auto & a, const auto & b) { return a.first > b.first; });
+    std::vector<int> chosen;
+    std::string chosen_list;
+    for (int i = 0; i < n && i < static_cast<int>(cpus.size()); i++) {
+        chosen.push_back(cpus[i].second);
+        chosen_list += (chosen_list.empty() ? "" : ",") + std::to_string(cpus[i].second);
+    }
+    desc = chosen_list + " of " + allowed_list;
+    return chosen;
+}
+
+/** Threads of llama.cpp only on the fastest cores; without it the system places them */
+void attach_fast_threads(int n_threads) {
+    std::vector<int> cores = fast_cores(n_threads, g_cores);
+    if (cores.empty()) { LOGW("cores not known (%s), the system places the threads", g_cores.c_str()); return; }
+    auto * dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    auto * reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    auto * new_fn = reg ? (decltype(ggml_threadpool_new) *) ggml_backend_reg_get_proc_address(reg, "ggml_threadpool_new") : nullptr;
+    g_threadpool_free = reg ? (decltype(ggml_threadpool_free) *) ggml_backend_reg_get_proc_address(reg, "ggml_threadpool_free") : nullptr;
+    if (new_fn == nullptr || g_threadpool_free == nullptr) { LOGW("no thread pool in the CPU backend"); return; }
+    ggml_threadpool_params params = ggml_threadpool_params_default(n_threads);
+    for (int core : cores) params.cpumask[core] = true;
+    params.strict_cpu = false; // all threads may use all chosen cores
+    g_threadpool = new_fn(&params);
+    if (g_threadpool == nullptr) { LOGW("thread pool not created"); return; }
+    llama_attach_threadpool(g_ctx, g_threadpool, nullptr);
+    LOGI("threads on cores %s", g_cores.c_str());
+}
+
 void unload_locked() {
     g_templates.reset();
     if (g_ctx != nullptr) { llama_free(g_ctx); g_ctx = nullptr; }
+    // after the context, which used it
+    if (g_threadpool != nullptr && g_threadpool_free != nullptr) g_threadpool_free(g_threadpool);
+    g_threadpool = nullptr;
+    g_cores.clear();
     if (g_model != nullptr) { llama_model_free(g_model); g_model = nullptr; }
     if (g_model_file != nullptr) { fclose(g_model_file); g_model_file = nullptr; }
 }
@@ -203,6 +265,7 @@ Java_helium314_keyboard_ai_plugin_LlamaNative_nativeLoad(JNIEnv * env, jclass, j
         unload_locked();
         return JNI_FALSE;
     }
+    attach_fast_threads(ctx_params.n_threads);
     try {
         g_templates = common_chat_templates_init(g_model, "");
     } catch (const std::exception & e) {
@@ -375,10 +438,11 @@ Java_helium314_keyboard_ai_plugin_LlamaNative_nativeGenerate(
         }
     }
 
-    char stats[256];
-    snprintf(stats, sizeof(stats), "prompt %d tokens %.0f ms (%.1f t/s), generated %d tokens %.0f ms (%.1f t/s), template %s",
+    char stats[320];
+    snprintf(stats, sizeof(stats), "prompt %d tokens %.0f ms (%.1f t/s), generated %d tokens %.0f ms (%.1f t/s), template %s, cores %s",
              n_prompt, prompt_ms, prompt_ms > 0 ? n_prompt * 1000.0 / prompt_ms : 0.0,
-             n_generated, gen_ms, gen_ms > 0 ? n_generated * 1000.0 / gen_ms : 0.0, used_template ? "yes" : "no");
+             n_generated, gen_ms, gen_ms > 0 ? n_generated * 1000.0 / gen_ms : 0.0, used_template ? "yes" : "no",
+             g_cores.empty() ? "system" : g_cores.c_str());
     g_stats = stats;
     LOGI("%s", stats);
     if (g_error == "cancelled" || thinking_unfinished) return nullptr;
