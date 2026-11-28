@@ -86,6 +86,15 @@ class OfflineAiProviderImpl : IOfflineAiProvider {
         }
     }
 
+    /**
+     * Stops a running generation, the model stays loaded. Not in the interface (version 1): the
+     * keyboard calls it by name if it exists, when a request is cancelled (X, keyboard hidden).
+     * Without it a cancelled request keeps computing and the next one waits for it.
+     */
+    fun cancelGeneration() {
+        LlamaNative.nativeCancel()
+    }
+
     override fun unloadModel() {
         // stops a running generation, then frees the model
         LlamaNative.nativeCancel()
